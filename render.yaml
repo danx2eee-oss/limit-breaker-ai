@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: limit-breaker-ai
+    runtime: python
+    plan: free
+    rootDir: Server
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn public_app:application --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 45 --access-logfile /dev/null
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      - key: DAILY_REQUEST_LIMIT
+        value: "400"
+      - key: MINUTE_REQUEST_LIMIT
+        value: "20"
