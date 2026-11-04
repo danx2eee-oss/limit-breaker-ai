@@ -55,7 +55,7 @@ def application(environ, start_response):
     method = environ.get("REQUEST_METHOD", "")
     if path == "/health" and method == "GET":
         return reply(200 if os.environ.get("GEMINI_API_KEY") else 503,
-                     {"ready": bool(os.environ.get("GEMINI_API_KEY")), "protocol": server.PROTOCOL})
+                     {"ready": bool(os.environ.get("GEMINI_API_KEY")), "protocol": server.PROTOCOL, "diagnosticsVersion": 1})
     if path != "/analyze":
         return reply(404, {"error": "Not found"})
     if method != "POST":
@@ -80,7 +80,7 @@ def application(environ, start_response):
     except server.RequestThrottled:
         return reply(429, {"error": "Analysis busy"})
     except urllib.error.HTTPError as error:
-        return reply(503, {"error": "AI unavailable", "upstreamStatus": error.code})
-    except Exception:
+        return reply(503, server.diagnostic_failure(error))
+    except Exception as error:
         # Never return exception strings, upstream bodies, headers or secrets.
-        return reply(503, {"error": "AI unavailable"})
+        return reply(503, server.diagnostic_failure(error))

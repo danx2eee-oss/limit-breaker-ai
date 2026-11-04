@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import math
+import logging
 import time
 from concurrent.futures import Future
 import urllib.request
@@ -136,17 +137,24 @@ def validate_stats(data):
         "judgements": validate_judgements(data.get("judgements"), sum(row["count"] for row in data["stats"]))}
 
 
+def guide_text(text, field):
+    if not isinstance(text, str):
+        raise ValueError("Invalid guide message")
+    clean = " ".join(text.split())
+    if not 1 <= len(clean) <= 100 or any(c in clean for c in "<>%") or any(c.isdigit() for c in clean):
+        logging.warning("AI_ROUTE_TEXT_NORMALIZED field=%s", field)
+        return "플레이 기록을 참고해 다음 경로를 준비했어요." if field == "message" else "박자와 입력 기록에 맞춰 경로를 조정했어요."
+    return clean
+
+
 def validate_plan(plan, stats, next_stage=2):
-    eligible = {r["skill"] for r in stats if r["count"] >= 3}
+    eligible = {r["skill"] for r in stats if r["count"] >= 3 and r["skill"] in ("Tap", "Hold")}
     focus = plan.get("focusSkills")
     if not isinstance(focus, list) or not 1 <= len(focus) <= 2 or len(set(focus)) != len(focus):
         raise ValueError("Invalid focus list")
     if any(s not in eligible for s in focus):
         raise ValueError("Unobserved focus skill")
-    for field in ("message", "adjustment"):
-        text = plan.get(field)
-        if not isinstance(text, str) or not 1 <= len(text) <= 100 or any(c in text for c in "<>\n\r%") or any(c.isdigit() for c in text):
-            raise ValueError("Invalid guide message")
+    dialogue = {field: guide_text(plan.get(field), field) for field in ("message", "adjustment")}
     if plan.get("stage") != next_stage or type(plan.get("stage")) is not int:
         raise ValueError("Wrong next stage")
     for field, low, high in (("noteSpeed",6,22), ("burstCount",2,4), ("chordSize",2,4)):
@@ -163,12 +171,51 @@ def validate_plan(plan, stats, next_stage=2):
         raise ValueError("Invalid lane weights")
     variety = plan.get("rhythmVariety", 1)
     if type(variety) is not int or not 1 <= variety <= 3: raise ValueError("Invalid rhythm variety")
-    return {**{field: plan[field] for field in fields}, "laneWeights": weights, "rhythmVariety": variety, "source": "gemini"}
+    return {**{field: plan[field] for field in fields}, **dialogue, "laneWeights": weights, "rhythmVariety": variety, "source": "gemini"}
 
 
 class RequestThrottled(Exception):
     def __init__(self, seconds):
         self.retry_after = max(1, math.ceil(seconds))
+
+
+def failure_info(error):
+    """Expose only retry metadata, never upstream response text or credentials."""
+    info = {"error": "AI unavailable", "upstreamStatus": error.code}
+    try:
+        payload = json.loads(error.read(65536)).get("error", {})
+        details = payload.get("details", [])
+        for detail in details:
+            for violation in detail.get("violations", []):
+                metric = (violation.get("quotaId", "") + " " + violation.get("quotaMetric", "")).lower()
+                if "perday" in metric or "per_day" in metric or "daily" in metric:
+                    info["quotaExhausted"] = True
+            delay = detail.get("retryDelay", "")
+            if isinstance(delay, str) and delay.endswith("s"):
+                info["retryAfterSeconds"] = min(86400, max(0, float(delay[:-1])))
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return info
+
+
+def diagnostic_failure(error):
+    """Stable diagnostic categories; exception text and model dialogue remain private."""
+    if isinstance(error, urllib.error.HTTPError):
+        info = failure_info(error)
+        code = "UPSTREAM_HTTP"
+    else:
+        info = {"error": "AI unavailable"}
+        if isinstance(error, TimeoutError): code = "UPSTREAM_TIMEOUT"
+        elif isinstance(error, urllib.error.URLError): code = "UPSTREAM_NETWORK"
+        elif isinstance(error, json.JSONDecodeError): code = "RESPONSE_JSON"
+        elif isinstance(error, ValueError):
+            code = {"Invalid guide message": "RESPONSE_TEXT", "Incomplete response": "RESPONSE_INCOMPLETE"}.get(str(error), "RESPONSE_SCHEMA")
+        elif isinstance(error, (KeyError, IndexError, TypeError)): code = "RESPONSE_SHAPE"
+        elif isinstance(error, RuntimeError) and str(error) == "GEMINI_API_KEY missing": code = "SERVER_CONFIGURATION"
+        else: code = "SERVER_INTERNAL"
+    info["errorCode"] = code
+    logging.warning("AI_ROUTE_FAILURE code=%s upstream=%s", code, info.get("upstreamStatus", "not-reported"))
+    return info
 
 
 def analyze(data):
@@ -214,14 +261,17 @@ def analyze(data):
 
 def fetch_plan(clean, key):
     cache_key = json.dumps(clean, sort_keys=True)
+    eligible = [row["skill"] for row in clean["stats"] if row["count"] >= 3 and row["skill"] in ("Tap", "Hold")]
+    if not eligible:
+        raise ValueError("Insufficient observations")
     properties = {
-        "focusSkills": {"type": "ARRAY", "items": {"type": "STRING", "enum": list(SKILLS)}, "minItems": 1, "maxItems": 2},
-        "message": {"type": "STRING"}, "adjustment": {"type": "STRING"}, "stage": {"type": "INTEGER"},
-        "noteSpeed": {"type": "NUMBER"}, "groupGapBeats": {"type": "NUMBER"},
-        "burstCount": {"type": "INTEGER"}, "burstIntervalBeats": {"type": "NUMBER"},
-        "chordSize": {"type": "INTEGER"}, "holdBeats": {"type": "NUMBER"}, "dualHolds": {"type": "BOOLEAN"},
-        "laneWeights": {"type": "ARRAY", "items": {"type": "INTEGER"}, "minItems": 4, "maxItems": 4},
-        "rhythmVariety": {"type": "INTEGER"}}
+        "focusSkills": {"type": "ARRAY", "items": {"type": "STRING", "enum": eligible}, "minItems": 1, "maxItems": min(2,len(eligible))},
+        "message": {"type": "STRING"}, "adjustment": {"type": "STRING"}, "stage": {"type": "INTEGER", "minimum": clean["nextStage"], "maximum": clean["nextStage"]},
+        "noteSpeed": {"type": "NUMBER", "minimum": 6, "maximum": 22}, "groupGapBeats": {"type": "NUMBER", "minimum": .5, "maximum": 2},
+        "burstCount": {"type": "INTEGER", "minimum": 2, "maximum": 4}, "burstIntervalBeats": {"type": "NUMBER", "minimum": .25, "maximum": .5},
+        "chordSize": {"type": "INTEGER", "minimum": 2, "maximum": 4}, "holdBeats": {"type": "NUMBER", "minimum": .5, "maximum": 1.5}, "dualHolds": {"type": "BOOLEAN"},
+        "laneWeights": {"type": "ARRAY", "items": {"type": "INTEGER", "minimum": 1, "maximum": 3}, "minItems": 4, "maxItems": 4},
+        "rhythmVariety": {"type": "INTEGER", "minimum": 1, "maximum": 3}}
     schema = {"type": "OBJECT", "properties": properties, "required": list(properties)}
     low, high = TARGETS[clean["nextStage"]]
     prompt = ("You are the sole difficulty designer of a four-key rhythm game. Review ALL skill summaries and per-round records. "
@@ -233,7 +283,7 @@ def fetch_plan(clean, key):
               "Scores are +100/+90/+70/+30/-30 for those grades, floored at zero. Use the full grade distribution when available. "
               "Use the observed grade shares plus upcoming duration/BPM to estimate energy. Never alter the gauge or score. "
               "If previous energy is higher than next target, increase challenge; if clearly lower, ease it. Use all rounds and all skills, with recent performance weighted more. "
-              "Choose 1 or 2 observed skills to introduce first; shuffled skill bags always include ALL five skills. "
+              "Choose 1 or 2 observed skills to introduce first; all generated notes are Tap or Hold; simultaneous and repeated taps are rhythmic patterns, not separate note types. "
               "Never recommend a weak-skills-only challenge. "
               "Analyze input.keys and input.groups (DF and JK), including each round's input, with recent rounds weighted more. "
               "count/successes measure opportunities and completed hits, presses measure actual key-downs. Compare success rates per opportunity, not raw press totals. "
@@ -245,7 +295,7 @@ def fetch_plan(clean, key):
               "If one group misses more or key confusion is frequent, ease speed, spacing, bursts or chords first and provide gentle balanced practice. "
               "Choose laneWeights as four integers 1..3 for D,F,J,K; equal weights mean balanced distribution. "
               "With sufficient evidence, moderately increase weights of weak keys for practice while easing other parameters; never remove strong keys or overwhelm weak keys. "
-              "Weights affect shuffled starting-lane bags separately for Tap/Hold/Repeat/Switch; chords use a shuffled bag of all pairs. "
+              "Weights affect Tap and Hold lane choices; simultaneous taps use shuffled lane pairs. "
               "Choose rhythmVariety integer 1..3 from observed ability, independently of speed. "
               "Level 1 shuffles skill order, lane choices, chord pairs and switch directions while keeping readable spacing. "
               "Level 2 also mixes burst sizes, hold lengths, offbeat tap/chord follow-ups and quarter-beat rests. "
@@ -321,9 +371,9 @@ class Handler(BaseHTTPRequestHandler):
         except RequestThrottled as error:
             self.reply(429, {"error": "Local request spacing", "retryAfterSeconds": error.retry_after})
         except urllib.error.HTTPError as error:
-            self.reply(503, {"error": "Gemini unavailable", "upstreamStatus": error.code})
-        except Exception:
-            self.reply(503, {"error": "AI analysis failed; retry required"})
+            self.reply(503, diagnostic_failure(error))
+        except Exception as error:
+            self.reply(503, diagnostic_failure(error))
 
 
 if __name__ == "__main__":
