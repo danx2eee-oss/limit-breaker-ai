@@ -278,7 +278,7 @@ def fetch_plan(clean, key):
               "You must choose actual next-stage chart parameters based on observed ability, previous settings, energy and timing errors. "
               f"INTERNAL ONLY: aim for final escape ENERGY {low} to {high}, not note accuracy. "
               "Energy starts at 30. Judgements are PERFECT/GREAT/GOOD/BAD/MISS; their energy changes are +5/+3/+1/-3/-6, clamped 0..100. Clear threshold is always 60. "
-              "Normal absolute timing windows are PERFECT<=45ms, GREAT<=90ms, GOOD<=120ms, BAD<=150ms, otherwise MISS; final-stage windows are 30/70/110/150ms. "
+              "All stages use absolute timing windows PERFECT<=46ms, GREAT<=83ms, GOOD<=118ms, BAD<=148ms, otherwise MISS. These are rounded means of normalized osu!mania OD5, StepMania default and Quaver Standard windows. The visible judgement band highlights PERFECT and GREAT only, up to 83ms; GOOD and BAD remain valid outside the highlight. Do not tighten timing windows for the final stage; adjust chart parameters instead. "
               "judgements arrays use [PERFECT,GREAT,GOOD,BAD,MISS] counts. BAD and MISS break combo and are not successes; only the first three are successes. "
               "Scores are +100/+90/+70/+30/-30 for those grades, floored at zero. Use the full grade distribution when available. "
               "Use the observed grade shares plus upcoming duration/BPM to estimate energy. Never alter the gauge or score. "
@@ -312,7 +312,9 @@ def fetch_plan(clean, key):
               "Provide message as Lumi's player-facing Korean dialogue in gentle polite speech, under 70 characters and at most two short sentences. "
               "Base it on observed gameplay AND the actual chosen next settings versus previous settings. "
               "Naturally preview whether the next path may feel a little harder, challenging, or more manageable, then encourage the player. "
-              "Do not always claim it gets harder when you actually eased the settings. For the final path encourage using everything learned. "
+              "Do not always claim it gets harder when you actually eased the settings. "
+              "Only nextStage 6 is the final path. For nextStage 2 through 5, describe the upcoming route and avoid wording that implies the journey is ending, including 마지막 and 최종. "
+              "For nextStage 6, encourage using everything learned. "
               "Speak directly to the player without speaker labels, model names, technical parameter names, or diagnostic jargon. "
               "Examples of tone only, never fixed output: 다음 경로는 조금 더 어려울 수도 있어요! 네 리듬을 믿어 봐요. "
               "Provide adjustment as an internal Korean reason matching chosen settings, under 70 chars. "
@@ -347,13 +349,24 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self):
-        if self.path == "/health":
+        if self.path == "/songs" or self.path.startswith("/songs/"):
+            self.serve_online_songs("GET")
+        elif self.path == "/health":
             self.reply(200, {"ready": bool(os.environ.get("GEMINI_API_KEY")), "model": MODEL, "protocol": PROTOCOL,
                 "requestsSent": CALLS, "minRequestIntervalSeconds": MIN_REQUEST_INTERVAL})
         else:
             self.reply(404, {"error": "Not found"})
 
     def do_POST(self):
+        if self.path == "/songs":
+            self.serve_online_songs("POST")
+            return
+        if self.path.startswith("/lobby/"):
+            if self.headers.get("Origin") or self.headers.get_content_type() != "application/json":
+                self.reply(403, {"error": "Native local client only"}); return
+            import online_lobby
+            self.reply(*online_lobby.dispatch(self.path, self.headers.get("Content-Length"), self.rfile))
+            return
         if self.path != "/analyze":
             self.reply(404, {"error": "Not found"}); return
         if self.headers.get("Origin") or self.headers.get_content_type() != "application/json":
@@ -374,6 +387,33 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(503, diagnostic_failure(error))
         except Exception as error:
             self.reply(503, diagnostic_failure(error))
+
+    def serve_online_songs(self, method):
+        import online_songs
+
+        if self.headers.get("Origin"):
+            self.reply(403, {"error": "Native local client only"})
+            return
+
+        def reply(status, payload):
+            self.reply(status, payload)
+            return ()
+
+        def start_response(status, headers):
+            self.send_response(int(status.split()[0]))
+            for key, value in headers:
+                self.send_header(key, value)
+            self.end_headers()
+
+        environ = {
+            "PATH_INFO": self.path, "REQUEST_METHOD": method, "wsgi.input": self.rfile,
+            "CONTENT_LENGTH": self.headers.get("Content-Length"),
+            "HTTP_AUTHORIZATION": self.headers.get("Authorization", ""),
+            "HTTP_X_SONG_FORMAT": self.headers.get("X-Song-Format", ""),
+            "HTTP_X_SONG_TITLE": self.headers.get("X-Song-Title", ""),
+        }
+        for block in online_songs.application(environ, start_response, reply, lambda: True):
+            self.wfile.write(block)
 
 
 if __name__ == "__main__":
