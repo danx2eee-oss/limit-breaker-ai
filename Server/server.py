@@ -6,6 +6,10 @@ import math
 import logging
 import time
 from concurrent.futures import Future
+from contextlib import contextmanager, closing
+from datetime import datetime, timedelta, timezone
+import sqlite3
+import tempfile
 import urllib.request
 import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +23,48 @@ INFLIGHT = {}
 LAST_REQUEST_AT = float("-inf")
 MIN_REQUEST_INTERVAL = 3.0
 PROTOCOL = 6
+KST = timezone(timedelta(hours=9))
+AI_USAGE_DB = os.environ.get("AI_USAGE_DB", os.path.join(tempfile.gettempdir(), "beatlimit-ai-usage.sqlite3"))
+
+
+def usage_connection():
+    db = sqlite3.connect(AI_USAGE_DB, timeout=2)
+    try:
+        db.execute("""CREATE TABLE IF NOT EXISTS ai_usage(
+            id INTEGER PRIMARY KEY, timestamp TEXT NOT NULL, kind TEXT NOT NULL, result TEXT NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS ai_usage_time ON ai_usage(timestamp)")
+        return db
+    except Exception:
+        db.close()
+        raise
+
+
+@contextmanager
+def record_ai_call(kind):
+    started = datetime.now(KST)
+    result = "failed"
+    try:
+        yield
+        result = "success"
+    finally:
+        try:
+            with closing(usage_connection()) as db, db:
+                db.execute("INSERT INTO ai_usage(timestamp,kind,result) VALUES (?,?,?)",
+                           (started.isoformat(timespec="milliseconds"), kind, result))
+                db.execute("DELETE FROM ai_usage WHERE timestamp < ?",
+                           ((started - timedelta(days=30)).isoformat(timespec="milliseconds"),))
+        except sqlite3.Error:
+            logging.warning("AI_USAGE_WRITE_FAILED")
+
+
+def ai_usage():
+    today = datetime.now(KST).date().isoformat()
+    with closing(usage_connection()) as db:
+        counts = dict(db.execute("SELECT kind,COUNT(*) FROM ai_usage WHERE timestamp >= ? GROUP BY kind", (today,)))
+        rows = db.execute("SELECT timestamp,kind,result FROM ai_usage ORDER BY timestamp DESC,id DESC LIMIT 100")
+        return {"date": today, "playCalls": counts.get("play", 0), "songCalls": counts.get("song", 0),
+                "entries": [dict(timestamp=stamp, kind=kind, result=result) for stamp, kind, result in rows]}
+
 TARGETS = {1: (90, 95), 2: (90, 95), 3: (82, 90), 4: (75, 82), 5: (68, 75), 6: (58, 61)}
 
 
@@ -326,14 +372,14 @@ def fetch_plan(clean, key):
     request = urllib.request.Request(
         "https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent",
         data=json.dumps(body).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": key})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        result = json.load(response)
-    candidate = result["candidates"][0]
-    if candidate.get("finishReason") != "STOP":
-        raise ValueError("Incomplete response")
-    raw = "".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought"))
-    plan = validate_plan(json.loads(raw), clean["stats"], clean["nextStage"])
-    return plan
+    with record_ai_call("play"):
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.load(response)
+        candidate = result["candidates"][0]
+        if candidate.get("finishReason") != "STOP":
+            raise ValueError("Incomplete response")
+        raw = "".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought"))
+        return validate_plan(json.loads(raw), clean["stats"], clean["nextStage"])
 
 
 class Handler(BaseHTTPRequestHandler):
