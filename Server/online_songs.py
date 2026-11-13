@@ -109,11 +109,12 @@ def analyze_audio(audio, extension, duration, title_hint=""):
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
     )
-    with request.urlopen(call, timeout=30) as response:
-        candidate = json.load(response)["candidates"][0]
-    if candidate.get("finishReason") != "STOP":
-        raise ValueError("Incomplete audio analysis")
-    return json.loads("".join(part.get("text", "") for part in candidate["content"]["parts"] if not part.get("thought")))
+    with server.record_ai_call("song"):
+        with request.urlopen(call, timeout=30) as response:
+            candidate = json.load(response)["candidates"][0]
+        if candidate.get("finishReason") != "STOP":
+            raise ValueError("Incomplete audio analysis")
+        return json.loads("".join(part.get("text", "") for part in candidate["content"]["parts"] if not part.get("thought")))
 
 
 def build_chart(plan, duration, audible):

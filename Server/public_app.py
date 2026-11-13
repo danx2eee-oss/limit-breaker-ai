@@ -55,6 +55,16 @@ def application(environ, start_response):
         return [body]
     path = environ.get("PATH_INFO", "")
     method = environ.get("REQUEST_METHOD", "")
+    if path == "/admin/ai-usage":
+        if method != "GET":
+            return reply(405, {"error": "GET required"})
+        error = online_songs.admin_error(environ)
+        if error:
+            return reply(*error)
+        try:
+            return reply(200, server.ai_usage())
+        except sqlite3.Error:
+            return reply(503, {"error": "AI 호출 기록을 읽을 수 없어요."})
     if path == "/songs" or path.startswith("/songs/"):
         return online_songs.application(environ, start_response, reply, reserve_request)
     if path.startswith("/lobby/"):
